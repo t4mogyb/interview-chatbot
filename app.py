@@ -77,7 +77,7 @@ SYSTEM_PROMPT = """
 
 # Gemini 모델 설정
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash-latest",
+    model_name="gemini-2.0-flash",
     system_instruction=SYSTEM_PROMPT
 )
 
