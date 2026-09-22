@@ -1,21 +1,28 @@
 import streamlit as st
 import google.generativeai as genai
+import random
+import time
 
-# 페이지 기본 설정
 st.set_page_config(page_title="6학년 국어 면담수업 챗봇", page_icon="💬", layout="centered")
 
 st.title("💬 6학년 국어 면담수업 챗봇")
 st.caption("국어 시간에 배운 '면담하기' 단원 실습을 위한 AI 챗봇입니다.")
 
-# API 키 설정 (Streamlit Secrets에서 불러옴)
+# Streamlit Secrets에서 API 키 목록을 가져오거나 단일 키를 리스트로 변환
 try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-    genai.configure(api_key=api_key)
+    raw_keys = st.secrets["GEMINI_API_KEY"]
+    if isinstance(raw_keys, str):
+        api_keys = [k.strip() for k in raw_keys.split(",")]
+    else:
+        api_keys = list(raw_keys)
+    
+    # 접속할 때마다 무작위로 API 키 선택 (트래픽 분산)
+    selected_key = random.choice(api_keys)
+    genai.configure(api_key=selected_key)
 except Exception:
-    st.error("API 키 설정이 필요합니다. Streamlit Secrets에 GEMINI_API_KEY를 설정해 주세요.")
+    st.error("API 키 설정이 필요합니다. Streamlit Secrets를 확인해 주세요.")
     st.stop()
 
-# 선생님이 작성하신 시스템 프롬프트 전문
 SYSTEM_PROMPT = """
 [챗봇의 역할 및 목표]
 당신은 초등학교 6학년 학생들의 국어 '면담하기' 단원 실습을 돕는 교육용 롤플레잉 챗봇입니다. 학생이 선택한 인물에 완벽히 몰입하여 1인칭 대화체로 면담에 응해주고, 면담 종료 후에는 '선생님 모드'로 전환하여 면담 태도와 질문 내용을 종합적으로 평가하고 피드백을 제공합니다.
@@ -75,16 +82,13 @@ SYSTEM_PROMPT = """
   - 면담 마무리하기: 끝인사(감사 인사) 여부 (생략 시 '생략함'으로 명시)
 """
 
-# Gemini 모델 설정
 model = genai.GenerativeModel(
-    model_name="gemini-3.6-flash",
+    model_name="gemini-3.6-flash-latest",
     system_instruction=SYSTEM_PROMPT
 )
 
-# 세션 상태 초기화
 if "chat" not in st.session_state:
     st.session_state.chat = model.start_chat(history=[])
-    # 첫 웰컴 메시지 등록
     first_msg = (
         "[대상 선택]\n"
         "안녕하세요! 오늘 국어시간 '면담하기' 실습을 함께할 챗봇이에요. "
@@ -96,23 +100,34 @@ if "chat" not in st.session_state:
     )
     st.session_state.messages = [{"role": "assistant", "content": first_msg}]
 
-# 화면 대화 내역 출력
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# 학생 입력 처리
 if user_input := st.chat_input("메시지를 입력하세요..."):
-    # 학생 메시지 화면 표시
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Gemini 답변 생성
-    try:
-        response = st.session_state.chat.send_message(user_input)
-        st.session_state.messages.append({"role": "assistant", "content": response.text})
-        with st.chat_message("assistant"):
-            st.markdown(response.text)
-    except Exception as e:
-        st.error(f"오류가 발생했습니다: {e}")
+    # API 초과 시 자동 재시도 로직 (최대 3회)
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        success = False
+        
+        for attempt in range(3):
+            try:
+                response = st.session_state.chat.send_message(user_input)
+                message_placeholder.markdown(response.text)
+                st.session_state.messages.append({"role": "assistant", "content": response.text})
+                success = True
+                break
+            except Exception as e:
+                if "429" in str(e) or "Resource" in str(e):
+                    message_placeholder.markdown(f"⏳ 사용자가 많아 대기 중입니다... ({attempt + 1}/3)")
+                    time.sleep(3)  # 3초 대기 후 재시도
+                else:
+                    message_placeholder.error(f"오류가 발생했습니다: {e}")
+                    break
+        
+        if not success:
+            message_placeholder.error("접속자가 많아 답변이 지연되고 있습니다. 10초 후 메시지를 다시 보내주세요.")
