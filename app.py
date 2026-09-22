@@ -1,28 +1,32 @@
 import streamlit as st
 import google.generativeai as genai
 import random
-import time
 
 st.set_page_config(page_title="6학년 국어 면담수업 챗봇", page_icon="💬", layout="centered")
 
 st.title("💬 6학년 국어 면담수업 챗봇")
 st.caption("국어 시간에 배운 '면담하기' 단원 실습을 위한 AI 챗봇입니다.")
 
-# Streamlit Secrets에서 API 키 목록을 가져오거나 단일 키를 리스트로 변환
-try:
-    raw_keys = st.secrets["GEMINI_API_KEY"]
-    if isinstance(raw_keys, str):
-        api_keys = [k.strip() for k in raw_keys.split(",")]
-    else:
-        api_keys = list(raw_keys)
-    
-    # 접속할 때마다 무작위로 API 키 선택 (트래픽 분산)
-    selected_key = random.choice(api_keys)
-    genai.configure(api_key=selected_key)
-except Exception:
-    st.error("API 키 설정이 필요합니다. Streamlit Secrets를 확인해 주세요.")
+# 1. API 키 목록 유연하게 가져오기 (문자열, 쉼표, 리스트 형태 모두 지원)
+def get_api_keys():
+    try:
+        raw_keys = st.secrets["GEMINI_API_KEY"]
+        if isinstance(raw_keys, str):
+            # 쉼표나 줄바꿈으로 구분된 키들을 리스트로 변환 (공백/따옴표 제거)
+            keys = [k.strip().strip('"').strip("'") for k in raw_keys.replace("\n", ",").split(",") if k.strip()]
+        else:
+            keys = [str(k).strip().strip('"').strip("'") for k in raw_keys if str(k).strip()]
+        return keys
+    except Exception:
+        return []
+
+api_keys = get_api_keys()
+
+if not api_keys:
+    st.error("⚠️ API 키가 설정되지 않았습니다. Streamlit Secrets에 GEMINI_API_KEY를 설정해 주세요.")
     st.stop()
 
+# 선생님이 작성하신 시스템 프롬프트 전문
 SYSTEM_PROMPT = """
 [챗봇의 역할 및 목표]
 당신은 초등학교 6학년 학생들의 국어 '면담하기' 단원 실습을 돕는 교육용 롤플레잉 챗봇입니다. 학생이 선택한 인물에 완벽히 몰입하여 1인칭 대화체로 면담에 응해주고, 면담 종료 후에는 '선생님 모드'로 전환하여 면담 태도와 질문 내용을 종합적으로 평가하고 피드백을 제공합니다.
@@ -82,13 +86,8 @@ SYSTEM_PROMPT = """
   - 면담 마무리하기: 끝인사(감사 인사) 여부 (생략 시 '생략함'으로 명시)
 """
 
-model = genai.GenerativeModel(
-    model_name="gemini-3.6-flash-latest",
-    system_instruction=SYSTEM_PROMPT
-)
-
-if "chat" not in st.session_state:
-    st.session_state.chat = model.start_chat(history=[])
+# 메시지 내역 초기화
+if "messages" not in st.session_state:
     first_msg = (
         "[대상 선택]\n"
         "안녕하세요! 오늘 국어시간 '면담하기' 실습을 함께할 챗봇이에요. "
@@ -100,34 +99,52 @@ if "chat" not in st.session_state:
     )
     st.session_state.messages = [{"role": "assistant", "content": first_msg}]
 
+# 화면 대화 내용 출력
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+# 사용자 입력 처리
 if user_input := st.chat_input("메시지를 입력하세요..."):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # API 초과 시 자동 재시도 로직 (최대 3회)
+    # 이전 대화 히스토리 구성 (Gemini 형식 변환)
+    gemini_history = []
+    for msg in st.session_state.messages[1:-1]:
+        role = "user" if msg["role"] == "user" else "model"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
+
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        success = False
-        
-        for attempt in range(3):
+        response_text = None
+        last_error = None
+
+        # 준비된 API 키 목록을 무작위로 섞음 (트래픽 균등 분산)
+        shuffled_keys = list(api_keys)
+        random.shuffle(shuffled_keys)
+
+        # 사용 가능한 API 키를 순서대로 시도
+        for key in shuffled_keys:
             try:
-                response = st.session_state.chat.send_message(user_input)
-                message_placeholder.markdown(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
-                success = True
-                break
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(
+                    model_name="gemini-3.6-flash",
+                    system_instruction=SYSTEM_PROMPT
+                )
+                chat = model.start_chat(history=gemini_history)
+                res = chat.send_message(user_input)
+                response_text = res.text
+                if response_text:
+                    break  # 성공 시 즉시 루프 종료
             except Exception as e:
-                if "429" in str(e) or "Resource" in str(e):
-                    message_placeholder.markdown(f"⏳ 사용자가 많아 대기 중입니다... ({attempt + 1}/3)")
-                    time.sleep(3)  # 3초 대기 후 재시도
-                else:
-                    message_placeholder.error(f"오류가 발생했습니다: {e}")
-                    break
-        
-        if not success:
-            message_placeholder.error("접속자가 많아 답변이 지연되고 있습니다. 10초 후 메시지를 다시 보내주세요.")
+                last_error = e
+                continue  # 실패 시 다음 키로 자동 넘어가서 실행
+
+        if response_text:
+            message_placeholder.markdown(response_text)
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
+        else:
+            # 모든 키가 실패했을 경우 실제 에러 원인 출력
+            message_placeholder.error(f"⚠️ 답변을 불러오지 못했습니다.\n\n**원인 분석:** {last_error}")
